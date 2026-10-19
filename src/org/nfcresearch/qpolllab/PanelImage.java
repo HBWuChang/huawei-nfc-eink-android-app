@@ -62,7 +62,7 @@ public final class PanelImage {
         Matrix rotate=new Matrix();rotate.setRotate(rotation);
         return Bitmap.createBitmap(source,0,0,source.getWidth(),source.getHeight(),rotate,true);
     }
-    public static Prepared prepare(Bitmap source,int rotation,boolean cover,boolean dither,int block,boolean binary,int threshold,boolean cropped) {
+    public static Prepared prepare(Bitmap source,int rotation,boolean cover,boolean dither,int block,boolean binary,int threshold,boolean cropped,int a0Mode) {
         if(block>1)dither=false;
         Bitmap input=rotated(source,rotation);
         Bitmap fitted=Bitmap.createBitmap(552,768,Bitmap.Config.ARGB_8888);Canvas canvas=new Canvas(fitted);canvas.drawColor(Color.WHITE);
@@ -72,9 +72,11 @@ public final class PanelImage {
         int[] pixels=new int[552*768];
         fitted.getPixels(pixels,0,552,0,0,552,768);
         byte[] codes=ImageRaster.quantize(pixels,552,768,binary,threshold,dither,block);
-        byte[] packed=PanelProtocol.packCodes(codes,552,768);
-        Bitmap image=Bitmap.createBitmap(ImageRaster.preview(packed,552,768),552,768,Bitmap.Config.ARGB_8888);
-        String settings=(binary?"黑白二值化 · 阈值 "+threshold:"黑白黄红四色")+" · 简化："+(block==1?"原始细节":block+"×"+block+" 色块")+" · 抖动："+(dither?"开启":"关闭")+" · "+(cropped?"已手动裁切 · ":"")+"旋转 "+rotation+"° · "+(cover?"填满":"留白");
+        byte[] packed=PanelProtocol.packCodes(codes,552,768,a0Mode);
+        byte[] previewPacked=PanelProtocol.packCodes(codes,552,768);
+        Bitmap image=Bitmap.createBitmap(ImageRaster.preview(previewPacked,552,768),552,768,Bitmap.Config.ARGB_8888);
+        String a0=a0Mode==0?"":(" · A0映射"+a0Mode);
+        String settings=(binary?"黑白二值化 · 阈值 "+threshold:"黑白黄红四色")+a0+" · 简化："+(block==1?"原始细节":block+"×"+block+" 色块")+" · 抖动："+(dither?"开启":"关闭")+" · "+(cropped?"已手动裁切 · ":"")+"旋转 "+rotation+"° · "+(cover?"填满":"留白");
         return new Prepared(image,packed,settings);
     }
 }

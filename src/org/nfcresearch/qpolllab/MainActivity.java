@@ -33,7 +33,7 @@ public final class MainActivity extends Activity {
     private PixelPreview preview;
     private ProgressBar progress;
     private Button refresh,stop;
-    private Spinner duration,fit,power,poll,blocks;
+    private Spinner duration,fit,power,poll,blocks,a0mode;
     private CheckBox dither,binary;
     private SeekBar threshold;
     private Bitmap source,originalSource;
@@ -148,7 +148,13 @@ public final class MainActivity extends Activity {
         int savedPoll=getSharedPreferences("refresh-settings",MODE_PRIVATE).getInt("pollMs",PanelProtocol.DEFAULT_POLL_MS),selectedPoll=pollTimes.length-1;for(int i=0;i<pollTimes.length;i++)if(pollTimes[i]==savedPoll)selectedPoll=i;poll.setSelection(selectedPoll);page.addView(poll);
         poll.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener(){public void onItemSelected(AdapterView<?> p,View v,int pos,long id){getSharedPreferences("refresh-settings",MODE_PRIVATE).edit().putInt("pollMs",pollTimes[pos]).apply();}public void onNothingSelected(AdapterView<?> p){}});
         page.addView(text("0 ms 表示收到应答后立即再次查询，实际频率取决于通信耗时。",12,0xff68766e));
-        page.addView(action("恢复默认参数",v->{power.setSelection(2);poll.setSelection(pollTimes.length-1);}));
+        section(page,"A0 面板映射 · 测试");
+        a0mode=spinner(new String[]{"关闭（当前布局）","A0-1 x=inv(i)","A0-2 x=551-inv(i)","A0-3 x=A0(i)","A0-4 x=551-A0(i)","A0-5 x=inv(551-i)","A0-6 x=551-inv(551-i)"});
+        int savedA0=getSharedPreferences("refresh-settings",MODE_PRIVATE).getInt("a0Mode",0);
+        a0mode.setSelection(Math.max(0,Math.min(6,savedA0)));page.addView(a0mode);
+        page.addView(text("先选一种 A0 映射，再用内置四色测试图发送；根据屏幕上的中线/镜像方向确定正确项。",12,0xff68766e));
+        a0mode.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener(){public void onItemSelected(AdapterView<?> p,View v,int pos,long id){getSharedPreferences("refresh-settings",MODE_PRIVATE).edit().putInt("a0Mode",pos).apply();prepare();}public void onNothingSelected(AdapterView<?> p){}});
+        page.addView(action("恢复默认参数",v->{power.setSelection(2);poll.setSelection(pollTimes.length-1);a0mode.setSelection(0);}));
         Button about=button("参考项目与许可证");about.setOnClickListener(v->showLicense());page.addView(about);
         page.addView(text("墨水屏刷新测试 · v2.9.3-root",12,0xff68766e));
         log=text("",11,0xff233c31);log.setTypeface(Typeface.MONOSPACE);log.setTextIsSelectable(true);log.setPadding(dp(10),dp(8),dp(10),dp(8));
@@ -168,9 +174,10 @@ public final class MainActivity extends Activity {
     private void controls(){boolean enabled=!busy&&!preparing&&!editingCrop;for(View v:idleControls)v.setEnabled(enabled);dither.setEnabled(enabled&&blocks.getSelectedItemPosition()==0);threshold.setEnabled(enabled&&binary.isChecked());refresh.setEnabled(enabled&&prepared!=null);stop.setEnabled(busy);stop.setVisibility(busy?View.VISIBLE:View.GONE);}
     private void prepare(){
         if(source==null||busy||destroyed||editingCrop)return;
+        final int a0=a0mode==null?0:a0mode.getSelectedItemPosition();
         final int token=++revision,angle=rotation,block=blockSizes[blocks.getSelectedItemPosition()],level=threshold.getProgress();final boolean cover=fit.getSelectedItemPosition()==1,noise=dither.isChecked(),mono=binary.isChecked(),hasCrop=cropped;final Bitmap input=source;
         prepared=null;preparing=true;controls();imageInfo.setText("正在生成四色预览…");
-        new Thread(()->{try{PanelImage.Prepared image=PanelImage.prepare(input,angle,cover,noise,block,mono,level,hasCrop);
+        new Thread(()->{try{PanelImage.Prepared image=PanelImage.prepare(input,angle,cover,noise,block,mono,level,hasCrop,a0);
             main.post(()->{if(token!=revision||destroyed)return;prepared=image;preview.setImage(image.preview);imageInfo.setText(imageName+" · 552×768 · "+image.packed.length+" 字节\n"+image.settings);preparing=false;controls();});
         }catch(Throwable e){main.post(()->{if(token!=revision||destroyed)return;preparing=false;controls();imageInfo.setText("预览失败："+e.getMessage());});}},"image-preview").start();
     }

@@ -98,12 +98,43 @@ public final class PanelProtocol {
     }
     /** Four vertical pixels per byte, right-to-left, bottom-to-top, MSB first. */
     public static byte[] packCodes(byte[] codes,int width,int height) {
+        return packCodes(codes,width,height,0);
+    }
+    // A0 panel physical row mapping from the public SE0398NZ07A0 driver:
+    // logical rows 0..275 -> even physical rows 0..550;
+    // logical rows 276..551 -> odd physical rows 551..1 in reverse.
+    public static int a0PhysicalRow(int logicalRow) {
+        if(logicalRow<276)return logicalRow*2;
+        return 551-2*(logicalRow-276);
+    }
+    public static int a0InverseRow(int physicalRow) {
+        if((physicalRow&1)==0)return physicalRow/2;
+        return 276+(551-physicalRow)/2;
+    }
+    /**
+     * Test-only A0 mapping variants. mode 0 keeps the existing layout.
+     * Modes 1..4 permute the 552 x columns before the normal packing.
+     */
+    public static byte[] packCodes(byte[] codes,int width,int height,int mode) {
         if(width<=0||height<=0||height%4!=0||codes.length!=width*height)throw new IllegalArgumentException("像素尺寸错误");
+        if(mode<0||mode>6)throw new IllegalArgumentException("A0映射模式错误");
+        if(mode!=0&&width!=552)throw new IllegalArgumentException("A0映射仅支持552列");
         byte[] packed=new byte[width*height/4];int out=0;
-        for(int x=width-1;x>=0;x--)for(int y=height-1;y>=0;y-=4) {
-            int value=0;
-            for(int n=0;n<4;n++){int code=codes[(y-n)*width+x]&255;if(code>3)throw new IllegalArgumentException("颜色码错误");value|=code<<(6-2*n);}
-            packed[out++]=(byte)value;
+        for(int p=0;p<width;p++) {
+            int x;
+            if(mode==0)x=width-1-p;
+            else if(mode==1)x=a0InverseRow(p);
+            else if(mode==2)x=width-1-a0InverseRow(p);
+            else if(mode==3)x=a0PhysicalRow(p);
+            else if(mode==4)x=width-1-a0PhysicalRow(p);
+            else if(mode==5)x=a0InverseRow(width-1-p);
+            else x=width-1-a0InverseRow(width-1-p);
+            if(x<0||x>=width)throw new IllegalArgumentException("A0映射越界");
+            for(int y=height-1;y>=0;y-=4) {
+                int value=0;
+                for(int n=0;n<4;n++){int code=codes[(y-n)*width+x]&255;if(code>3)throw new IllegalArgumentException("颜色码错误");value|=code<<(6-2*n);}
+                packed[out++]=(byte)value;
+            }
         }
         return packed;
     }
