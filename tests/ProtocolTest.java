@@ -9,13 +9,17 @@ public final class ProtocolTest {
     static final byte[] OK=PanelProtocol.hex("9000");
     // Synthetic UID; profile bytes describe the supported screen configuration.
     static final byte[] INFO=PanelProtocol.hex("A007F0C72006000228A10700120030FFFFFFB10102B20114B30100C004201EA001C10401020304D107012000000000009000");
+    // D1 response observed on the 23127PN0CC / SN220 test device. C0 starts
+    // with 00000001 instead of the reference panel's 201EA001; only the final
+    // compression flag is panel/firmware invariant.
+    static final byte[] DEVICE_INFO=PanelProtocol.hex("A007F0C72006000228A10700120030FFFFFFB10102B20114B30100C00400000001C1047EFF711ED107012000000000009000");
     static int cases;
     static void eq(boolean ok,String message){if(!ok)throw new AssertionError(message);}
     interface Action {void run()throws Exception;}
     static void rejects(Action action,String message)throws Exception{try{action.run();throw new AssertionError("Expected rejection: "+message);}catch(AssertionError e){throw e;}catch(Exception expected){}}
     static final class Fake implements PanelProtocol.Control,PanelProtocol.Transport {
         long time,cancelAt=-1;int d3,d4,de,pin,d8,d1,failD3=-1,cancelAtD3=-1,pollMs=500,deLatencyMs;
-        boolean authNeeded,failPin,failD4,noBusy,foreverBusy,malformedBusy,cancel,cancelBeforeD4,cancelWhilePolling;
+        boolean authNeeded,failPin,failD4,failD4Lost,failDELost,noBusy,foreverBusy,malformedBusy,cancel,cancelBeforeD4,cancelWhilePolling;
         byte[] info=INFO;
         ArrayList<String> events=new ArrayList<>();ArrayList<byte[]> uploads=new ArrayList<>();
         ArrayList<Long> deTimes=new ArrayList<>();
@@ -29,8 +33,8 @@ public final class ProtocolTest {
                 case 0xD8:d8++;return authNeeded&&pin==0?PanelProtocol.hex("6985"):OK;
                 case 0x20:pin++;eq(PanelProtocol.toHex(cmd).equals("00200001055265699919"),"published PIN APDU");return failPin?PanelProtocol.hex("63C2"):OK;
                 case 0xD3:d3++;uploads.add(cmd.clone());if(d3==cancelAtD3)cancel=true;return d3==failD3?PanelProtocol.hex("6995"):OK;
-                case 0xD4:d4++;eq(PanelProtocol.toHex(cmd).equals("F0D4948000"),"D4 power timing");return failD4?PanelProtocol.hex("6502"):OK;
-                case 0xDE:deTimes.add(time);time+=deLatencyMs;de++;if(malformedBusy)return PanelProtocol.hex("029000");return PanelProtocol.hex((foreverBusy||(!noBusy&&de<=2))?"019000":"009000");
+                case 0xD4:d4++;eq(PanelProtocol.toHex(cmd).equals("F0D4948000"),"D4 power timing");if(failD4Lost)throw new java.io.IOException("Tag was lost");return failD4?PanelProtocol.hex("6502"):OK;
+                case 0xDE:deTimes.add(time);time+=deLatencyMs;de++;if(failDELost)throw new java.io.IOException("Tag was lost");if(malformedBusy)return PanelProtocol.hex("029000");return PanelProtocol.hex((foreverBusy||(!noBusy&&de<=2))?"019000":"009000");
                 default:throw new AssertionError("Unexpected command: "+PanelProtocol.toHex(cmd));
             }
         }
@@ -47,6 +51,10 @@ public final class ProtocolTest {
     }
     public static void main(String[] args)throws Exception{
         PanelProtocol.parseInfo(INFO);passed("synthetic D1 exact profile");
+        eq(PanelProtocol.parseInfo(DEVICE_INFO).uid.equals("7EFF711E"),"device D1 UID");
+        eq(PanelProtocol.parseInfo(DEVICE_INFO).description().contains("固件=0x14"),"device firmware diagnostic");passed("device D1 profile with C0 00000001");
+        byte[] badCompression=DEVICE_INFO.clone();badCompression[32]=0;
+        rejects(()->PanelProtocol.parseInfo(badCompression),"compression flag clear");
         eq(PanelProtocol.parseInfo(withUid(PanelProtocol.hex("12345678"))).uid.equals("12345678"),"different UID is display only");
         eq(PanelProtocol.parseInfo(withUid(PanelProtocol.hex("01020304050607"))).uid.equals("01020304050607"),"no UID length restriction");
         eq(PanelProtocol.parseInfo(withUid(null)).uid.equals("未提供"),"UID field is optional");passed("different, longer and absent UID accepted without ID validation");
@@ -70,10 +78,12 @@ public final class ProtocolTest {
             if(p[3]==1){eq(current.size()==(block==52?1996:2012),"final compressed block length");current.reset();block++;blocks++;sub=0;}
             else{eq(count==250,"non-final application stride remains 250");sub++;}}
         eq(blocks==53&&compressed==106620&&current.size()==0,"53 complete LZO blocks, final raw length1984");passed("476 D3 packets / 53 blocks / one D4 / busy to idle");
-        Fake auth=new Fake();auth.authNeeded=true;auth.run();eq(auth.pin==1&&auth.d8==2,"one default PIN only");passed("conditional single PIN verification");
+        Fake auth=new Fake();auth.authNeeded=true;auth.run();eq(auth.pin==2&&auth.d8==2,"two reference PIN verifications");passed("conditional two PIN verifications");
         Fake pinBad=new Fake();pinBad.authNeeded=true;pinBad.failPin=true;rejects(pinBad::run,"PIN failure");eq(pinBad.pin==1&&pinBad.d3+pinBad.d4==0,"PIN is not retried");passed("PIN failure stops without guessing");
         Fake uploadBad=new Fake();uploadBad.failD3=3;rejects(uploadBad::run,"D3 failure");eq(uploadBad.d3==3&&uploadBad.d4==0,"failed D3 not retried and no D4");passed("upload failure stops before refresh");
         Fake refreshBad=new Fake();refreshBad.failD4=true;rejects(refreshBad::run,"D4 failure");eq(refreshBad.d4==1&&refreshBad.de==0,"D4 not replayed");passed("D4 error is never replayed");
+        Fake d4Lost=new Fake();d4Lost.failD4Lost=true;d4Lost.run();eq(d4Lost.d4==1&&d4Lost.de==0&&d4Lost.emitted("REFRESH_UNCONFIRMED")&&!d4Lost.emitted("REFRESH_DONE"),"D4 tag loss is unconfirmed and not replayed");passed("D4 TagLost reports unconfirmed without replay");
+        Fake deLost=new Fake();deLost.failDELost=true;deLost.run();eq(deLost.d4==1&&deLost.de==1&&deLost.emitted("REFRESH_UNCONFIRMED"),"DE tag loss is unconfirmed");passed("DE TagLost reports unconfirmed without D4 replay");
         Fake idle=new Fake();idle.noBusy=true;idle.run();eq(idle.emitted("REFRESH_UNCONFIRMED")&&!idle.emitted("REFRESH_DONE")&&idle.time>=21000,"idle only cannot claim refresh");passed("idle-only outcome remains unconfirmed");
         Fake stuck=new Fake();stuck.foreverBusy=true;rejects(stuck::run,"90s refresh deadline");eq(stuck.d4==1&&!stuck.emitted("REFRESH_DONE"),"timeout no replay");passed("busy timeout bounded without replay");
         Fake malformed=new Fake();malformed.malformedBusy=true;rejects(malformed::run,"invalid DE");eq(!malformed.emitted("REFRESH_DONE"),"invalid busy response not success");passed("invalid DE state rejected");

@@ -31,19 +31,66 @@ public final class ShellBridge extends Binder {
   if(code==2){synchronized(lock){reply.writeNoException();reply.writeString(logs.toString());logs.setLength(0);reply.writeInt(active?1:0);}return true;}
   cancel();reply.writeNoException();return true;
  }
+ private static String quote(String s){return "'"+s.replace("'","'\\''")+"'";}
  private void run(String mode,int seconds,String json,byte[] bytes)throws Exception {
+  final int uid=android.os.Process.myUid();
+  final boolean qpoll=mode.equals("qtag")||mode.equals("identity")||mode.equals("refresh");
+  log("QP|BRIDGE_STATE|UID="+uid+"；模式="+mode);
+  if(qpoll&&uid!=0){log("QP|ERROR|Q-Poll 需要 Shizuku 以 Root 启动（当前 UID="+uid+"）");return;}
   File dir=new File("/data/local/tmp/qpoll-bridge-"+android.os.Process.myPid()+"-"+System.nanoTime());if(!dir.mkdir())throw new IOException("Cannot create session directory");
   if(new ProcessBuilder("chmod","700",dir.toString()).start().waitFor()!=0)throw new IOException("Cannot protect session directory");
-  File mark=new File(dir,"stop"),job=new File(dir,"job.json"),image=new File(dir,"image.bin");stop=mark;
+  File mark=new File(dir,"stop"),job=new File(dir,"job.json"),image=new File(dir,"image.bin"),lock=new File(dir,"session.lock"),worker=new File(dir,"worker.sh");stop=mark;
   java.lang.Process child=null;
   try{
-   if(cancelled)mark.createNewFile();JSONObject settings=new JSONObject(json);if(bytes.length>0)settings.put("imageFile",image.toString());
+   if(cancelled)mark.createNewFile();JSONObject settings=new JSONObject(json);String hookDir=settings.optString("hookDir","");if(bytes.length>0)settings.put("imageFile",image.toString());
    try(FileOutputStream out=new FileOutputStream(image)){out.write(bytes);}try(FileOutputStream out=new FileOutputStream(job)){out.write(settings.toString().getBytes("UTF-8"));}
-   java.util.ArrayList<String> command=new java.util.ArrayList<>();java.util.Collections.addAll(command,"/system/bin/app_process","/system/bin","org.nfcresearch.qpolllab.QPollWorker",mode,""+seconds,mark.toString(),new File(dir,"session.lock").toString());if(mode.equals("identity")||mode.equals("refresh"))command.add(job.toString());
-   ProcessBuilder builder=new ProcessBuilder(command).redirectErrorStream(true);builder.environment().put("CLASSPATH",apk);child=builder.start();final java.lang.Process running=child;
+   if(uid==0){
+    String args=mode+" "+seconds+" "+quote(mark.toString())+" "+quote(lock.toString())+(mode.equals("identity")||mode.equals("refresh")?" "+quote(job.toString()):"");
+    String script="#!/system/bin/sh\nCLASSPATH="+quote(apk)+"\nexport CLASSPATH\nexec /system/bin/app_process /system/bin org.nfcresearch.qpolllab.QPollWorker "+args+"\n";
+    write(worker,script);installHook(dir,hookDir,qpoll);
+    if(new ProcessBuilder("chown","-R","2000:2000",dir.toString()).start().waitFor()!=0)throw new IOException("Cannot hand session directory to shell UID");
+    String inner=(new File("/system/bin/runcon").exists()?"runcon u:r:shell:s0 ":"")+"sh "+quote(worker.toString());
+    child=new ProcessBuilder("su","2000","-c",inner).redirectErrorStream(true).start();
+   }else{
+    java.util.ArrayList<String> command=new java.util.ArrayList<>();java.util.Collections.addAll(command,"/system/bin/app_process","/system/bin","org.nfcresearch.qpolllab.QPollWorker",mode,""+seconds,mark.toString(),lock.toString());if(mode.equals("identity")||mode.equals("refresh"))command.add(job.toString());
+    ProcessBuilder builder=new ProcessBuilder(command).redirectErrorStream(true);builder.environment().put("CLASSPATH",apk);child=builder.start();
+   }
+   final java.lang.Process running=child;
    Thread deadline=new Thread(()->{try{if(!running.waitFor(320,TimeUnit.SECONDS)){mark.createNewFile();if(!running.waitFor(10,TimeUnit.SECONDS))running.destroy();}}catch(Exception ignored){}});deadline.setDaemon(true);deadline.start();
    try(BufferedReader in=new BufferedReader(new InputStreamReader(child.getInputStream(),"UTF-8"))){String line;while((line=in.readLine())!=null)log(line);}
    int exit=child.waitFor();if(exit!=0)log("QP|PROCESS_EXIT|"+exit);
-  }finally{mark.createNewFile();if(child!=null&&!child.waitFor(10,TimeUnit.SECONDS))child.destroy();stop=null;job.delete();image.delete();mark.delete();new File(dir,"session.lock").delete();dir.delete();}
+  }finally{
+   try{new ProcessBuilder("/system/bin/sh","-c","rm -f /data/vendor/nfc/qphook/enable").start().waitFor();}catch(Exception ignored){}
+   mark.createNewFile();if(child!=null&&!child.waitFor(10,TimeUnit.SECONDS))child.destroy();stop=null;job.delete();image.delete();mark.delete();lock.delete();worker.delete();new File(dir,"hook.sh").delete();dir.delete();
+  }
+ }
+ private static void write(File file,String text)throws IOException{try(FileOutputStream out=new FileOutputStream(file)){out.write(text.getBytes("UTF-8"));}file.setReadable(true,true);}
+ private void installHook(File dir,String hookDir,boolean enabled)throws Exception{
+  if(hookDir==null||hookDir.isEmpty()){log("QP|HOOK|未提供兼容层路径，跳过注入");return;}
+  File script=new File(dir,"hook.sh");
+  // A new file name per session: overwriting a .so that is already mapped in
+  // the HAL can corrupt its code pages and crash the vendor process.
+  String unique="libqpollhook-"+System.nanoTime()+".so";
+  String dest="/data/vendor/nfc/qphook/"+unique;
+  String text="#!/system/bin/sh\n"
+   +"RES=/data/local/tmp/qpolllab-res\n"
+   +"mkdir -p \"$RES\"\n"
+   +"cp "+quote(new File(hookDir,"qpoll-inject").getPath())+" \"$RES/qpoll-inject\" || echo 'QP|HOOK|无法复制注入器'\n"
+   +"cp "+quote(new File(hookDir,"libqpollhook.so").getPath())+" \"$RES/libqpollhook.so\" || echo 'QP|HOOK|无法复制兼容层'\n"
+   +"chmod 0755 \"$RES/qpoll-inject\"\n"
+   +"mkdir -p /data/vendor/nfc/qphook 2>/dev/null\n"
+   +"cp \"$RES/libqpollhook.so\" "+quote(dest)+" || echo 'QP|HOOK|无法复制兼容层到 HAL 目录'\n"
+   +"chown nfc:nfc "+quote(dest)+" 2>/dev/null\n"
+   +"chmod 0755 "+quote(dest)+" 2>/dev/null\n"
+   +"chcon u:object_r:vendor_file:s0 "+quote(dest)+" 2>/dev/null || echo 'QP|HOOK|chcon 失败，HAL 可能拒绝加载'\n"
+   +"if \"$RES/qpoll-inject\" "+quote(dest)+"; then echo 'QP|HOOK|兼容层已注入 NFC HAL'; else echo 'QP|HOOK|兼容层注入失败'; fi\n"
+   +"for f in /data/vendor/nfc/qphook/libqpollhook-*.so; do [ \"$f\" = "+quote(dest)+" ] || rm -f \"$f\"; done\n"
+   +(enabled
+     ?": > /data/vendor/nfc/qphook/enable && chown nfc:nfc /data/vendor/nfc/qphook/enable 2>/dev/null; chmod 0644 /data/vendor/nfc/qphook/enable; chcon u:object_r:vendor_file:s0 /data/vendor/nfc/qphook/enable 2>/dev/null; echo 'QP|HOOK|Q-Poll 发现已启用'\n"
+     :"rm -f /data/vendor/nfc/qphook/enable; echo 'QP|HOOK|Q-Poll 发现未启用'\n");
+  write(script,text);
+  java.lang.Process process=new ProcessBuilder("/system/bin/sh",script.toString()).redirectErrorStream(true).start();
+  try(BufferedReader in=new BufferedReader(new InputStreamReader(process.getInputStream(),"UTF-8"))){String line;while((line=in.readLine())!=null)log(line);}
+  int code=process.waitFor();if(code!=0)log("QP|HOOK|注入脚本退出码="+code);
  }
 }
